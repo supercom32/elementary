@@ -228,6 +228,11 @@ type Instance struct {
 	screenshotArchiver       archiver.Archiver
 	archiverMutex            sync.Mutex
 
+	// minimizeWatchers holds one entry per window currently enforced by MinimizeWindow(true), keyed by that
+	// window's Chrome DevTools Protocol windowId. Each value is closed by stopMinimizeWatcherUnlocked or
+	// stopAllMinimizeWatchersUnlocked to signal that window's watcher goroutine to exit. Guarded by stateMutex.
+	minimizeWatchers map[any]chan struct{}
+
 	// Parameters for reinitialization
 	defaultContextAlias string
 	defaultPageAlias    string

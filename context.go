@@ -2,10 +2,14 @@ package elementary
 
 import (
 	"fmt"
+	"math/rand"
+	"time"
+
 	"github.com/mxschmitt/playwright-go"
 	"github.com/supercom32/elementary/logger"
-	"math/rand"
 )
+
+const minimizeWatcherPollInterval = 100 * time.Millisecond
 
 /*
 getRandomViewportVariation is a function which yields a pseudo-random offset within a range of 0 to 200 pixels. This
@@ -148,6 +152,394 @@ func (shared *Instance) GetCurrentPage() playwright.Page {
 	shared.stateMutex.RLock()
 	defer shared.stateMutex.RUnlock()
 	return shared.currentPage
+}
+
+/*
+minimizeWindowSession is a structure which bundles the results of resolving the browser window behind the currently
+active page: an open Chrome DevTools Protocol session, that window's identifier, and the page the session was opened
+against. MinimizeWindow and RestoreWindow both resolve one of these before acting, so the window identifier used to
+key a watcher is guaranteed to match the window their Chrome DevTools Protocol command actually targeted.
+*/
+type minimizeWindowSession struct {
+	cdpSession playwright.CDPSession
+	windowID   any
+	page       playwright.Page
+}
+
+/*
+resolveCurrentWindowSession is a method which allows you to open a Chrome DevTools Protocol session against the
+currently active page and resolve the identifier of the browser window that page belongs to. This is the shared
+first step behind MinimizeWindow and RestoreWindow, so both methods key their watcher bookkeeping off the exact same
+window identifier they are about to send a command against. It takes the calling method's own name, actionName, so
+that a Chrome-only error names whichever of MinimizeWindow or RestoreWindow the caller actually invoked. In addition,
+the following should be noted:
+
+  - This method returns a nil session and a nil error, without opening anything, if no page is currently active,
+    since there is no window to resolve. Callers must check for a nil session before using the result.
+
+  - The returned session is left open on success. Callers are responsible for detaching it once they are done
+    issuing commands against the resolved window.
+
+Example:
+
+	windowSession, err := shared.resolveCurrentWindowSession("MinimizeWindow")
+*/
+func (shared *Instance) resolveCurrentWindowSession(actionName string) (*minimizeWindowSession, error) {
+	if shared.browserType != BROWSER_CHROME {
+		return nil, fmt.Errorf("%s is only supported when the active browser is Chrome, got '%s'", actionName, shared.browserType)
+	}
+
+	page := shared.GetCurrentPage()
+	if page == nil {
+		return nil, nil
+	}
+
+	cdpSession, err := page.Context().NewCDPSession(page)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := cdpSession.Send("Browser.getWindowForTarget", nil)
+	if err != nil {
+		cdpSession.Detach()
+		return nil, err
+	}
+
+	return &minimizeWindowSession{
+		cdpSession: cdpSession,
+		windowID:   result.(map[string]any)["windowId"],
+		page:       page,
+	}, nil
+}
+
+/*
+MinimizeWindow is a method which allows you to collapse the active browser window down to the taskbar via the Chrome
+DevTools Protocol, optionally keeping it collapsed afterward. This is useful for automation flows that need the
+browser process to keep running without its window remaining visible on screen. In addition, the following should be
+noted:
+
+  - This method is only supported when the active browser is Chrome, since it relies on the Chrome DevTools Protocol's
+    Browser domain. Calling it while any other browser is active returns an error without attempting the operation.
+
+  - This method returns nil without effect if no page is currently active, since there is no window to target.
+
+  - Enforcement is scoped to the window itself, identified by its Chrome DevTools Protocol window identifier, rather
+    than to whichever tab happened to be active when enforce was passed as true. Closing that tab does not stop
+    enforcement as long as another tab in the same window, tracked or not, remains open.
+
+  - When enforce is true, this method starts a background watcher, or leaves an already running one in place, that
+    polls the window state on minimizeWatcherPollInterval and re-minimizes it whenever it is no longer minimized. A
+    separate watcher runs independently for each window that has been enforced, so minimizing one window has no
+    effect on watchers already running against other windows.
+
+  - When enforce is false, only the watcher for this specific window is stopped, and the window itself is minimized
+    once and left alone afterward. Watchers running against other windows are left untouched.
+
+Example:
+
+	err := agent.MinimizeWindow(true)
+*/
+func (shared *Instance) MinimizeWindow(enforce bool) error {
+	windowSession, err := shared.resolveCurrentWindowSession("MinimizeWindow")
+	if err != nil {
+		return err
+	}
+	if windowSession == nil {
+		return nil
+	}
+	defer windowSession.cdpSession.Detach()
+
+	_, err = windowSession.cdpSession.Send("Browser.setWindowBounds", map[string]any{
+		"windowId": windowSession.windowID,
+		"bounds": map[string]any{
+			"windowState": "minimized",
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	shared.stateMutex.Lock()
+	defer shared.stateMutex.Unlock()
+	if enforce {
+		shared.startMinimizeWatcherUnlocked(windowSession.windowID, windowSession.page)
+	} else {
+		shared.stopMinimizeWatcherUnlocked(windowSession.windowID)
+	}
+	return nil
+}
+
+/*
+RestoreWindow is a method which allows you to undo a prior minimize by returning the active browser window to its
+normal state via the Chrome DevTools Protocol, and disables the background watcher, if any, enforcing that specific
+window. In addition, the following should be noted:
+
+  - This method is only supported when the active browser is Chrome, since it relies on the Chrome DevTools Protocol's
+    Browser domain. Calling it while any other browser is active returns an error without attempting the operation.
+
+  - This method returns nil without effect if no page is currently active, since there is no window to target.
+
+  - This method only stops the watcher for the window behind the currently active page. Watchers enforcing other
+    windows are left running.
+
+  - This method stops that watcher before restoring the window, so it cannot race the restore and immediately
+    re-minimize it.
+
+Example:
+
+	err := agent.RestoreWindow()
+*/
+func (shared *Instance) RestoreWindow() error {
+	windowSession, err := shared.resolveCurrentWindowSession("RestoreWindow")
+	if err != nil {
+		return err
+	}
+	if windowSession == nil {
+		return nil
+	}
+	defer windowSession.cdpSession.Detach()
+
+	shared.stateMutex.Lock()
+	shared.stopMinimizeWatcherUnlocked(windowSession.windowID)
+	shared.stateMutex.Unlock()
+
+	_, err = windowSession.cdpSession.Send("Browser.setWindowBounds", map[string]any{
+		"windowId": windowSession.windowID,
+		"bounds": map[string]any{
+			"windowState": "normal",
+		},
+	})
+	return err
+}
+
+/*
+startMinimizeWatcherUnlocked is a method which allows you to start the background goroutine that keeps the browser
+window identified by windowID minimized by polling its state and correcting any drift. anchorPage is only a starting
+point for the watcher's first Chrome DevTools Protocol session rather than a fixed target, since the watcher moves
+its enforcement to any other page confirmed to belong to the same window once anchorPage closes. This is a no-op if
+a watcher for windowID is already running. Callers must already hold stateMutex.
+
+Example:
+
+	shared.startMinimizeWatcherUnlocked(windowID, page)
+*/
+func (shared *Instance) startMinimizeWatcherUnlocked(windowID any, anchorPage playwright.Page) {
+	if _, isAlreadyRunning := shared.minimizeWatchers[windowID]; isAlreadyRunning {
+		return
+	}
+	if shared.minimizeWatchers == nil {
+		shared.minimizeWatchers = make(map[any]chan struct{})
+	}
+	stop := make(chan struct{})
+	shared.minimizeWatchers[windowID] = stop
+	go shared.runMinimizeWatcher(windowID, anchorPage, stop)
+}
+
+/*
+stopMinimizeWatcherUnlocked is a method which allows you to stop the background minimize watcher running against the
+window identified by windowID, if one is running. This is a no-op if windowID has no active watcher. Callers must
+already hold stateMutex.
+
+Example:
+
+	shared.stopMinimizeWatcherUnlocked(windowID)
+*/
+func (shared *Instance) stopMinimizeWatcherUnlocked(windowID any) {
+	if stop, isRunning := shared.minimizeWatchers[windowID]; isRunning {
+		close(stop)
+		delete(shared.minimizeWatchers, windowID)
+	}
+}
+
+/*
+stopAllMinimizeWatchersUnlocked is a method which allows you to stop every running background minimize watcher,
+regardless of which window each one is enforcing. This is used during teardown, where every watcher must be stopped
+together rather than one window at a time. Callers must already hold stateMutex.
+
+Example:
+
+	shared.stopAllMinimizeWatchersUnlocked()
+*/
+func (shared *Instance) stopAllMinimizeWatchersUnlocked() {
+	for windowID, stop := range shared.minimizeWatchers {
+		close(stop)
+		delete(shared.minimizeWatchers, windowID)
+	}
+}
+
+/*
+isBrowserConnectedUnlocked is a method which reports whether browserInstance is non-nil and still reports itself as
+connected. This is the single place the watcher checks for a permanently gone browser process, as opposed to a
+transient per-page error. Callers must already hold at least a read lock on stateMutex.
+
+Example:
+
+	if !shared.isBrowserConnectedUnlocked() { return }
+*/
+func (shared *Instance) isBrowserConnectedUnlocked() bool {
+	return shared.browserInstance != nil && shared.browserInstance.IsConnected()
+}
+
+/*
+clearMinimizeWatcherIfCurrent is a method which allows you to remove windowID's entry from minimizeWatchers, but only
+if it still points at the supplied stop channel identifying the watcher goroutine that is exiting. This lets a
+watcher that is exiting on its own, because the window it was watching is gone or the browser disconnected, clean up
+its own bookkeeping without clobbering a different, newer watcher that may have already been started for the same
+windowID in its place.
+
+Example:
+
+	shared.clearMinimizeWatcherIfCurrent(windowID, stop)
+*/
+func (shared *Instance) clearMinimizeWatcherIfCurrent(windowID any, stop chan struct{}) {
+	shared.stateMutex.Lock()
+	if shared.minimizeWatchers[windowID] == stop {
+		delete(shared.minimizeWatchers, windowID)
+	}
+	shared.stateMutex.Unlock()
+}
+
+/*
+findWindowSession is a method which allows you to locate a live page belonging to the browser window identified by
+windowID and open a Chrome DevTools Protocol session against it. This is how a watcher recovers once its current
+page closes: rather than giving up on the window, it looks for another surviving page confirmed to belong to the
+same window and moves its enforcement there. It returns the open session and the page it was opened against if a
+surviving page was found, or a nil session, nil page, and false if none of the candidates resolved to windowID or
+the search was abandoned because stop was closed. In addition, the following should be noted:
+
+  - This method checks lastAnchor, the most recently used page for this window, first, then every other page
+    currently open in lastAnchor's browser context, including untracked popup pages Elementary never registered a
+    page alias for, since the window can outlive any single tab within it, tracked or not.
+
+  - This method checks the stop channel before opening a session against each candidate page, so a caller closing
+    the watcher mid search only waits on whichever single candidate check is already in flight, rather than the
+    entire remaining candidate list.
+
+  - A candidate only counts as a match once its own getWindowForTarget resolution is confirmed equal to windowID.
+    Belonging to the same browser context is necessary to be considered but is not by itself sufficient, since a
+    context can host pages spread across more than one window.
+
+Example:
+
+	session, page, found := shared.findWindowSession(windowID, lastAnchor, stop)
+*/
+func (shared *Instance) findWindowSession(windowID any, lastAnchor playwright.Page, stop chan struct{}) (playwright.CDPSession, playwright.Page, bool) {
+	candidates := make([]playwright.Page, 0, 1)
+	if lastAnchor != nil {
+		if !lastAnchor.IsClosed() {
+			candidates = append(candidates, lastAnchor)
+		}
+		for _, page := range lastAnchor.Context().Pages() {
+			if page != lastAnchor {
+				candidates = append(candidates, page)
+			}
+		}
+	}
+
+	for _, page := range candidates {
+		select {
+		case <-stop:
+			return nil, nil, false
+		default:
+		}
+
+		if page.IsClosed() {
+			continue
+		}
+		session, err := page.Context().NewCDPSession(page)
+		if err != nil {
+			continue
+		}
+		result, err := session.Send("Browser.getWindowForTarget", nil)
+		if err != nil {
+			session.Detach()
+			continue
+		}
+		if result.(map[string]any)["windowId"] == windowID {
+			return session, page, true
+		}
+		session.Detach()
+	}
+	return nil, nil, false
+}
+
+/*
+runMinimizeWatcher is a method which allows you to poll the browser window identified by windowID on
+minimizeWatcherPollInterval and re-minimize it whenever it is no longer minimized, starting from anchorPage as its
+first Chrome DevTools Protocol session target. This runs until the supplied stop channel is closed, or until the
+window it is watching can no longer be reached. In addition, the following should be noted:
+
+  - This method reuses a single Chrome DevTools Protocol session across polls rather than opening a new one on every
+    tick, only detaching and recreating it once a send against it fails, such as after the page it was opened against
+    closes. Recreating the session calls findWindowSession, which looks across every page in the window, tracked or
+    not, before concluding the window itself is gone.
+
+  - This method exits on its own, without requiring a caller to close the stop channel, once the browser it is
+    watching is no longer connected, or once findWindowSession cannot locate any surviving page for windowID. Either
+    way, it clears its own entry out of minimizeWatchers on its way out, so a later MinimizeWindow call against a
+    freshly reinitialized browser, or a fresh instance of the same window, starts a new watcher instead of treating
+    one as already running.
+
+  - Errors from an individual poll are swallowed and simply retried on the next tick, since most of them reflect an
+    expected transient state, such as the active page having just closed, rather than a permanent failure.
+
+Example:
+
+	go shared.runMinimizeWatcher(windowID, page, stopChannel)
+*/
+func (shared *Instance) runMinimizeWatcher(windowID any, anchorPage playwright.Page, stop chan struct{}) {
+	ticker := time.NewTicker(minimizeWatcherPollInterval)
+	defer ticker.Stop()
+
+	var cdpSession playwright.CDPSession
+	currentAnchor := anchorPage
+	defer func() {
+		if cdpSession != nil {
+			cdpSession.Detach()
+		}
+	}()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			shared.stateMutex.RLock()
+			isBrowserConnected := shared.isBrowserConnectedUnlocked()
+			shared.stateMutex.RUnlock()
+			if !isBrowserConnected {
+				shared.clearMinimizeWatcherIfCurrent(windowID, stop)
+				return
+			}
+
+			if cdpSession == nil {
+				session, page, found := shared.findWindowSession(windowID, currentAnchor, stop)
+				if !found {
+					shared.clearMinimizeWatcherIfCurrent(windowID, stop)
+					return
+				}
+				cdpSession = session
+				currentAnchor = page
+			}
+
+			result, err := cdpSession.Send("Browser.getWindowBounds", map[string]any{"windowId": windowID})
+			if err != nil {
+				cdpSession.Detach()
+				cdpSession = nil
+				continue
+			}
+
+			bounds, _ := result.(map[string]any)["bounds"].(map[string]any)
+			if bounds["windowState"] != "minimized" {
+				_, _ = cdpSession.Send("Browser.setWindowBounds", map[string]any{
+					"windowId": windowID,
+					"bounds": map[string]any{
+						"windowState": "minimized",
+					},
+				})
+			}
+		}
+	}
 }
 
 /*

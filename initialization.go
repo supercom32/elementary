@@ -240,6 +240,7 @@ func (shared *Instance) InitializeDriver(defaultContextAlias string, defaultPage
 	shared.defaultNavigationTimeout = 30 * time.Second
 	shared.defaultPlaywrightTimeout = 5 * time.Second
 	shared.defaultSelectorEngine = SELECTOR_ENGINE_XPATH
+	shared.browserType = browserType
 	if browserOptions != nil {
 		shared.browserOptions = *browserOptions
 	} else {
@@ -279,7 +280,7 @@ func (shared *Instance) InitializeDriver(defaultContextAlias string, defaultPage
 	if browserType == BROWSER_CHROME {
 		chromiumArgs := shared.browserOptions.Args
 		if chromiumArgs == nil {
-			chromiumArgs = []string{"--mute-audio", "--remote-debugging-port=9222"}
+			chromiumArgs = []string{"--mute-audio"}
 		}
 		chromiumLaunchOptions := playwright.BrowserTypeLaunchOptions{
 			Headless: playwright.Bool(isHeadless),
@@ -601,14 +602,20 @@ func (shared *Instance) Terminate() error {
 resetTeardownStateUnlocked is a method which nils out the driver/browser/context/page references
 and resets the context and page indices to their sentinel "nothing active" values. This is the
 single place Terminate and Shutdown agree on what a fully torn-down Instance looks like, so the
-two teardown paths can't drift out of sync on which fields get reset. Callers must already hold
-stateMutex.
+two teardown paths can't drift out of sync on which fields get reset. In addition, the following
+should be noted:
+
+  - This method stops every active MinimizeWindow(true) watcher goroutine, across every window being enforced, since
+    they would otherwise keep polling a browser process that is being torn down.
+
+Callers must already hold stateMutex.
 
 Example:
 
 	shared.resetTeardownStateUnlocked()
 */
 func (shared *Instance) resetTeardownStateUnlocked() {
+	shared.stopAllMinimizeWatchersUnlocked()
 	shared.playwrightInstance = nil
 	shared.browserInstance = nil
 	shared.contextInstances = nil

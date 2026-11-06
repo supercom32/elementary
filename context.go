@@ -41,16 +41,18 @@ func (shared *Instance) hasActiveContextUnlocked() bool {
 }
 
 /*
-ResetContext is a method which closes and regenerates a specified browser context. This discards all active cookies,
-cached storage pools, and session tracking states, returning the environment to a pristine state.
+ResetContext is a method which allows you to close and regenerate a specified browser context. This discards all
+active cookies, cached storage pools, and session tracking states, returning the environment to a pristine state. It
+returns any error raised while creating the replacement context, so a failed reset is never mistaken for a
+successful one.
 
 Example:
 
-	agent.ResetContext("main-session", 1920, 1080, nil)
+	err := agent.ResetContext("main-session", 1920, 1080, nil)
 */
-func (shared *Instance) ResetContext(contextAlias string, viewportWidth int, viewportHeight int, browserOptions *BrowserOptions) {
+func (shared *Instance) ResetContext(contextAlias string, viewportWidth int, viewportHeight int, browserOptions *BrowserOptions) error {
 	shared.CloseContext(contextAlias)
-	_ = shared.NewContext(contextAlias, viewportWidth, viewportHeight, browserOptions)
+	return shared.NewContext(contextAlias, viewportWidth, viewportHeight, browserOptions)
 }
 
 /*
@@ -60,6 +62,9 @@ the following should be noted:
 
   - This method automatically adds random viewport variations to the requested size. This prevents automated web servers from detecting
     identical static resolution fingerprints across repeatedly spawned browser automation sessions.
+
+  - The user agent is taken from browserOptions when it is non-nil, and from the BrowserOptions the Instance was
+    initialized with otherwise. An empty UserAgent leaves Playwright's default user agent in place.
 
 Example:
 
@@ -85,10 +90,12 @@ func (shared *Instance) NewContext(aliasName string, viewportWidth int, viewport
 	}
 	options.Viewport = &viewport
 
-	if browserOptions == nil {
-		if shared.browserOptions.UserAgent != "" {
-			options.UserAgent = &shared.browserOptions.UserAgent
-		}
+	userAgent := shared.browserOptions.UserAgent
+	if browserOptions != nil {
+		userAgent = browserOptions.UserAgent
+	}
+	if userAgent != "" {
+		options.UserAgent = &userAgent
 	}
 	if shared.browserInstance == nil {
 		return logger.Error(fmt.Errorf("browser instance is not initialized"), "failed to create new browser context for alias %s", aliasName)

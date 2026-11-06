@@ -36,7 +36,11 @@ func (shared *Instance) SaveNetscapeCookies(fileName string) error {
 	}
 	for _, currentCookie := range cookies {
 		expireTime := fmt.Sprintf("%f", currentCookie.Expires)
-		cookieLine := currentCookie.Domain + "\tTRUE\t/\t" + strings.ToUpper(strconv.FormatBool(currentCookie.Secure)) + "\t" + expireTime + "\t" + currentCookie.Name + "\t" + currentCookie.Value + "\n"
+		cookiePath := currentCookie.Path
+		if cookiePath == "" {
+			cookiePath = "/"
+		}
+		cookieLine := currentCookie.Domain + "\tTRUE\t" + cookiePath + "\t" + strings.ToUpper(strconv.FormatBool(currentCookie.Secure)) + "\t" + expireTime + "\t" + currentCookie.Name + "\t" + currentCookie.Value + "\n"
 		if err := filesystem.AppendLineToFile(fileName, cookieLine, 0); err != nil {
 			return logger.Error(fmt.Errorf("failed to write cookie to file %s: %w", fileName, err), "failed to write cookie to file %s", fileName)
 		}
@@ -45,31 +49,59 @@ func (shared *Instance) SaveNetscapeCookies(fileName string) error {
 }
 
 /*
-AddCookie is a method which inserts a single designated cookie into the current browser context. This allows seeding targeted
-identification tags, tracking configurations, or authentication tokens prior to launching navigation pipelines. In addition, the following should be noted:
+AddCookie is a method which allows you to insert a single designated cookie into the current browser context. This
+allows seeding targeted identification tags, tracking configurations, or authentication tokens prior to launching
+navigation pipelines. An optional CookieOptions controls the cookie's path, Secure, HttpOnly, and SameSite flags, and
+its lifetime. When no CookieOptions is supplied, the cookie is a session cookie scoped to path "/" with no security
+flags set. In addition, the following should be noted:
 
-- This method assigns a default expiry time set to exactly 10,000 seconds in the future, ensuring the cookie remains active throughout the session.
+  - Only the first CookieOptions is used; any additional values are ignored.
 
-- This method will return an error if the underlying Playwright instance fails to add the cookie to the active browser context.
+  - A zero CookieOptions.ExpiresIn creates a session cookie that expires when the browser context closes, rather than
+    a cookie with a fixed lifetime.
+
+  - This method will return an error if no browser context is active or if the underlying Playwright instance fails
+    to add the cookie to the active browser context.
 
 Example:
 
-	err := agent.AddCookie(".example.com", "session_token", "secretXYZ")
+	err := agent.AddCookie(".example.com", "session_token", "secretXYZ", elementary.CookieOptions{
+	    Secure:    true,
+	    HTTPOnly:  true,
+	    SameSite:  "Lax",
+	    ExpiresIn: time.Hour,
+	})
 */
-func (shared *Instance) AddCookie(domain string, name string, value string) error {
+func (shared *Instance) AddCookie(domain string, name string, value string, options ...CookieOptions) error {
 	shared.stateMutex.Lock()
 	defer shared.stateMutex.Unlock()
 	if !shared.hasActiveContextUnlocked() {
 		return logger.Error(fmt.Errorf("no active browser context exists to add cookie"), "failed to add cookie to browser context")
 	}
-	var cookie playwright.OptionalCookie
-	cookie.Domain = &domain
-	cookie.Name = name
-	cookie.Value = value
-	cookie.Path = &[]string{"/"}[0]
-	cookie.Secure = &[]bool{false}[0]
-	expireTime := float64([]int{int(time.Now().Unix() + 10000)}[0])
-	cookie.Expires = &expireTime
+	var config CookieOptions
+	if len(options) > 0 {
+		config = options[0]
+	}
+	cookiePath := config.Path
+	if cookiePath == "" {
+		cookiePath = "/"
+	}
+	cookie := playwright.OptionalCookie{
+		Name:     name,
+		Value:    value,
+		Domain:   &domain,
+		Path:     &cookiePath,
+		Secure:   playwright.Bool(config.Secure),
+		HttpOnly: playwright.Bool(config.HTTPOnly),
+	}
+	if config.SameSite != "" {
+		sameSite := playwright.SameSiteAttribute(config.SameSite)
+		cookie.SameSite = &sameSite
+	}
+	if config.ExpiresIn != 0 {
+		expireTime := float64(time.Now().Add(config.ExpiresIn).Unix())
+		cookie.Expires = &expireTime
+	}
 	err := shared.contextInstances[shared.currentContextIndex].instance.AddCookies([]playwright.OptionalCookie{cookie})
 	if err != nil {
 		return logger.Error(fmt.Errorf("failed to add cookie via playwright: %w", err), "failed to add cookie to browser context")

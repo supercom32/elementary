@@ -89,6 +89,31 @@ func applySelectorTimeout(selector Selector, options []ActionOptions) []ActionOp
 }
 
 /*
+CookieOptions is a structure which encapsulates the optional configuration values accepted by AddCookie, letting
+callers control a cookie's path, security flags, and lifetime instead of always getting a fixed set of defaults.
+The zero value creates a session cookie scoped to path "/" with no security flags set.
+*/
+type CookieOptions struct {
+	// Path is the cookie's path scope. Empty defaults to "/".
+	Path string
+
+	// Secure marks the cookie Secure, restricting it to HTTPS connections. Many sites require
+	// this for session cookies served over HTTPS.
+	Secure bool
+
+	// HTTPOnly marks the cookie HttpOnly, making it inaccessible to page JavaScript.
+	HTTPOnly bool
+
+	// SameSite is the cookie's SameSite attribute: "Strict", "Lax", or "None". Empty leaves the
+	// attribute unset, letting the browser apply its own default.
+	SameSite string
+
+	// ExpiresIn is how long from now the cookie should expire. The zero value creates a session
+	// cookie that expires when the browser context closes.
+	ExpiresIn time.Duration
+}
+
+/*
 Selector is a structure which pairs a Playwright-style selector string with a human-readable description of the
 element it targets. Every action method that locates an element by selector accepts one of these instead of a bare
 string, so that reusable, named selectors (declared once, referenced everywhere) automatically carry a meaningful
@@ -167,10 +192,10 @@ type BrowserOptions struct {
 	Channel string
 
 	// Args overrides the command-line arguments passed to the browser at launch, per
-	// Playwright's Args launch option. When nil, Chromium launches with Elementary's defaults
-	// ("--mute-audio", "--remote-debugging-port=9222") and Firefox launches with none. Setting
-	// Args replaces the list entirely rather than appending to it, so callers who want to keep
-	// the Chromium defaults alongside their own flags must include them explicitly.
+	// Playwright's Args launch option. When nil, Chromium launches with Elementary's default
+	// ("--mute-audio") and Firefox launches with none. Setting Args replaces the list entirely
+	// rather than appending to it, so callers who want to keep the Chromium default alongside
+	// their own flags must include it explicitly.
 	Args []string
 }
 

@@ -6,7 +6,9 @@ import (
 	"github.com/mxschmitt/playwright-go"
 	"github.com/supercom32/elementary/logger"
 	"github.com/supercom32/filesystem"
+	"mime"
 	neturl "net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,8 +40,13 @@ func (shared *Instance) captureScreenshot(actionName string, stage string, detai
 }
 
 /*
-GetElementAttribute is a method which extracts the value of a designated attribute from a target DOM element. This
-retrieves runtime properties such as hyperlinks, resource paths, or style classes from the rendered markup.
+GetElementAttribute is a method which allows you to extract the value of a designated attribute from a target DOM
+element. This retrieves runtime properties such as hyperlinks, resource paths, or style classes from the rendered
+markup. An empty string is returned when no element matches the selector. In addition, the following should be noted:
+
+  - Requesting the "value" attribute, in any letter case, reads the element's live value property instead of its
+    markup attribute, so text typed into an input (for example via FillElement) is returned rather than the input's
+    initial value. Elements that have no value property fall back to the markup attribute.
 
 Example:
 
@@ -59,12 +66,27 @@ func (shared *Instance) GetElementAttribute(attribute string, selector Selector,
 	if count == 0 {
 		return "", nil
 	}
+	if strings.EqualFold(attribute, "value") {
+		liveValue, err := element.Evaluate(liveValueScript, nil, playwright.LocatorEvaluateOptions{Timeout: &timeoutInMilliseconds})
+		if err != nil {
+			return "", logger.Error(err, "failed to read live value on selector %s", selector)
+		}
+		if liveValueString, isString := liveValue.(string); isString {
+			return liveValueString, nil
+		}
+	}
 	returnedAttribute, err := element.GetAttribute(attribute, playwright.LocatorGetAttributeOptions{Timeout: &timeoutInMilliseconds})
 	if err != nil {
 		return "", logger.Error(err, "failed to read attribute %s on selector %s", attribute, selector)
 	}
 	return returnedAttribute, nil
 }
+
+/*
+liveValueScript reads an element's live value property as a string, or null when the element has no value property,
+so callers can tell "no value property" apart from "an empty value".
+*/
+const liveValueScript = `el => (el.value === undefined || el.value === null) ? null : String(el.value)`
 
 /*
 ClickElement is a method which dispatches a mouse click event to the DOM node matched by the given selector. This
@@ -393,8 +415,13 @@ func (shared *Instance) GetElement(selector Selector, parentLocator playwright.L
 }
 
 /*
-UploadFile is a method which binds local file payloads directly to a target file input DOM selector. This automates multi-part
-file uploads by mapping files from local storage streams.
+UploadFile is a method which allows you to bind local file payloads directly to a target file input DOM selector. This
+automates multi-part file uploads by mapping files from local storage streams, labelling each upload with the MIME
+type inferred from the file name's extension rather than assuming a fixed type. In addition, the following should be
+noted:
+
+  - An unrecognized or missing extension falls back to "application/octet-stream", the standard generic binary MIME
+    type, rather than mislabelling the upload as a specific type it may not actually be.
 
 Example:
 
@@ -413,7 +440,7 @@ func (shared *Instance) UploadFile(selector Selector, fileName string, options .
 	}
 	fileEntry := playwright.InputFile{
 		Name:     fileName,
-		MimeType: "image/jpeg",
+		MimeType: detectMimeType(fileName),
 		Buffer:   fileContentsInBytes,
 	}
 	err = page.SetInputFiles(selector.Value, []playwright.InputFile{fileEntry}, playwright.PageSetInputFilesOptions{Timeout: &timeoutInMilliseconds})
@@ -421,6 +448,28 @@ func (shared *Instance) UploadFile(selector Selector, fileName string, options .
 		return logger.Error(err, "failed to upload file through playwright")
 	}
 	return nil
+}
+
+/*
+detectMimeType is a function which allows you to infer a file's MIME type from its extension. Any parameters such as
+"; charset=utf-8" are stripped so only the bare media type is returned, and an unrecognized or missing extension
+yields "application/octet-stream".
+
+Example:
+
+	mimeType := detectMimeType("photo.png")
+*/
+func detectMimeType(fileName string) string {
+	const fallbackMimeType = "application/octet-stream"
+	mimeType := mime.TypeByExtension(filepath.Ext(fileName))
+	if mimeType == "" {
+		return fallbackMimeType
+	}
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return fallbackMimeType
+	}
+	return mediaType
 }
 
 /*
@@ -1014,12 +1063,18 @@ prevents ad networks, tracking pixels, or hijacked pages from redirecting the ac
 In addition, the following should be noted:
 
   - Script-driven navigation (location assignment, meta-refresh tags) is neutralized directly in the page via an injected script.
+
   - Main frame navigation requests are also gated at the network layer: once NavigateTo establishes a target hostname for the
     context, any subsequent top-level navigation request to a different hostname is aborted outright, regardless of whether it
     originated from a script, a synthetic click, or a real click on a hijacked full-page link. This is what actually stops sites
     that redirect via native anchor navigation rather than JavaScript location APIs.
+
   - Navigating to a different hostname on purpose still works; calling NavigateTo again simply updates the allowed hostname
     before its own request is evaluated.
+
+  - Rejected navigations are cancelled rather than failed, so the tab stays on its current page instead of being
+    replaced by the browser's error page.
+
   - blockedHosts is an optional list of additional hostnames (ad networks, trackers, etc.) to reject outright, for every
     resource type, regardless of the navigation gate above. Matching is by exact hostname or subdomain (e.g. "ads.example.com"
     matches a blocked "example.com"), not a partial/substring match, so unrelated domains that merely share a suffix (e.g.
@@ -1107,7 +1162,7 @@ func (shared *Instance) BlockRedirects(blockedHosts ...string) error {
 			for _, blockedHost := range blockedHosts {
 				if hostIsOrIsSubdomainOf(targetHost, blockedHost) {
 					logger.Log(logger.TYPE_DEBUG, "Blocked request to '%s' matching blocked host '%s'", request.URL(), blockedHost)
-					_ = route.Abort()
+					_ = route.Abort(abortedNavigationErrorCode)
 					return
 				}
 			}
@@ -1136,13 +1191,21 @@ func (shared *Instance) BlockRedirects(blockedHosts ...string) error {
 			return
 		}
 		logger.Log(logger.TYPE_DEBUG, "Blocked cross-site redirect attempt to '%s'", request.URL())
-		_ = route.Abort()
+		_ = route.Abort(abortedNavigationErrorCode)
 	}); err != nil {
 		logger.Log(logger.TYPE_WARN, "Route registration failed: %v", err)
 	}
 
 	return nil
 }
+
+/*
+abortedNavigationErrorCode is the Playwright abort error code BlockRedirects uses for every request it rejects. It maps
+to net::ERR_ABORTED, which cancels a main frame navigation without committing Chromium's error page, so the current
+page's content stays in place. Playwright's default code (net::ERR_FAILED) would instead replace the page with
+"chrome-error://chromewebdata/", destroying the very content BlockRedirects exists to protect.
+*/
+const abortedNavigationErrorCode = "aborted"
 
 /*
 hostsAreSameSite is a function which compares two hostnames to determine if they belong to the same site. This treats a

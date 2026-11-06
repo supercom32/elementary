@@ -211,16 +211,16 @@ Valid values are `"chrome"`, `"chrome-beta"`, `"chrome-dev"`, `"chrome-canary"`,
 
 ## Overriding Launch Arguments
 
-`BrowserOptions.Args` overrides the command-line arguments passed to the browser at launch, matching Playwright's own `Args` launch option. When left `nil`, Chromium launches with Elementary's defaults (`--mute-audio`, `--remote-debugging-port=9222`) and Firefox launches with none:
+`BrowserOptions.Args` overrides the command-line arguments passed to the browser at launch, matching Playwright's own `Args` launch option. When left `nil`, Chromium launches with Elementary's default (`--mute-audio`) and Firefox launches with none:
 
 ```go
 browser := Elementary.Instance{}
 err := browser.Initialize("default_ctx", "shop", Elementary.BROWSER_CHROME, 1280, 800, true, &Elementary.BrowserOptions{
-    Args: []string{"--mute-audio", "--remote-debugging-port=9222", "--lang=fr-FR"},
+    Args: []string{"--mute-audio", "--lang=fr-FR"},
 })
 ```
 
-Setting `Args` replaces the list entirely rather than appending to it. Elementary's Chromium defaults are `--mute-audio` and `--remote-debugging-port=9222`. If you want to keep them alongside your own flags, include them explicitly as shown above.
+Setting `Args` replaces the list entirely rather than appending to it. Elementary's Chromium default is `--mute-audio`. If you want to keep it alongside your own flags, include it explicitly as shown above.
 
 # Example
 

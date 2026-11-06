@@ -63,8 +63,12 @@ the following should be noted:
   - This method automatically adds random viewport variations to the requested size. This prevents automated web servers from detecting
     identical static resolution fingerprints across repeatedly spawned browser automation sessions.
 
-  - The user agent is taken from browserOptions when it is non-nil, and from the BrowserOptions the Instance was
-    initialized with otherwise. An empty UserAgent leaves Playwright's default user agent in place.
+  - Every context answers JavaScript dialogs according to SetDialogOptions, including dialogs shown before that
+    method is first called, so a dialog can never leave a page stuck waiting for an answer.
+
+  - The user agent and saved session (StorageStatePath) are taken from browserOptions when it is non-nil, and from
+    the BrowserOptions the Instance was initialized with otherwise. An empty UserAgent leaves Playwright's default
+    user agent in place, and an empty StorageStatePath starts the context with a clean session.
 
 Example:
 
@@ -90,12 +94,15 @@ func (shared *Instance) NewContext(aliasName string, viewportWidth int, viewport
 	}
 	options.Viewport = &viewport
 
-	userAgent := shared.browserOptions.UserAgent
+	effectiveOptions := shared.browserOptions
 	if browserOptions != nil {
-		userAgent = browserOptions.UserAgent
+		effectiveOptions = *browserOptions
 	}
-	if userAgent != "" {
-		options.UserAgent = &userAgent
+	if effectiveOptions.UserAgent != "" {
+		options.UserAgent = playwright.String(effectiveOptions.UserAgent)
+	}
+	if effectiveOptions.StorageStatePath != "" {
+		options.StorageStatePath = playwright.String(effectiveOptions.StorageStatePath)
 	}
 	if shared.browserInstance == nil {
 		return logger.Error(fmt.Errorf("browser instance is not initialized"), "failed to create new browser context for alias %s", aliasName)
@@ -106,9 +113,12 @@ func (shared *Instance) NewContext(aliasName string, viewportWidth int, viewport
 	}
 	newContextEntry.alias = aliasName
 	newContextEntry.instance.SetDefaultNavigationTimeout(float64(shared.defaultNavigationTimeout.Milliseconds()))
+	newContextEntry.instance.OnDialog(func(dialog playwright.Dialog) {
+		shared.handleDialog(aliasName, dialog)
+	})
 	shared.contextInstances = append(shared.contextInstances, newContextEntry)
 	shared.currentContextIndex = len(shared.contextInstances) - 1
-	shared.currentPage = nil
+	shared.setCurrentPageUnlocked(nil)
 	shared.currentPageIndex = NULL_PAGE
 	return nil
 }
@@ -143,7 +153,7 @@ func (shared *Instance) NewPage(aliasName string) error {
 	shared.contextInstances[shared.currentContextIndex].pageInstances =
 		append(shared.contextInstances[shared.currentContextIndex].pageInstances, newPageEntry)
 	shared.currentPageIndex = len(shared.contextInstances[shared.currentContextIndex].pageInstances) - 1
-	shared.currentPage = shared.contextInstances[shared.currentContextIndex].pageInstances[shared.currentPageIndex].instance
+	shared.setCurrentPageUnlocked(shared.contextInstances[shared.currentContextIndex].pageInstances[shared.currentPageIndex].instance)
 	return nil
 }
 
@@ -571,6 +581,29 @@ func (shared *Instance) InjectJavaScript(script string) error {
 }
 
 /*
+EvaluateJavaScript is a method which allows you to evaluate a JavaScript expression or function on the active page
+and get its result back. Unlike InjectJavaScript, which only reports whether evaluation failed, this returns the
+value the script produced, converted to Go: numbers become float64 or int, strings string, booleans bool, arrays
+[]any, objects map[string]any, and undefined or null nil. Any args are passed to script when it is a function.
+
+Example:
+
+	title, err := agent.EvaluateJavaScript("document.title")
+	sum, err := agent.EvaluateJavaScript("([a, b]) => a + b", []int{2, 3})
+*/
+func (shared *Instance) EvaluateJavaScript(script string, args ...any) (any, error) {
+	page, err := shared.getCurrentPage()
+	if err != nil {
+		return nil, err
+	}
+	result, err := page.Evaluate(script, args...)
+	if err != nil {
+		return nil, logger.Error(err, "failed to evaluate javascript")
+	}
+	return result, nil
+}
+
+/*
 SwitchContext is a method which transfers structural focus to a distinct browser context by alias. This redirects the target
 context pool, maintaining isolated cookiestores and state profiles across browser pipelines. In addition, the following should be noted:
 
@@ -590,7 +623,7 @@ func (shared *Instance) SwitchContext(contextAlias string) error {
 		return logger.Error(fmt.Errorf("context '%s' does not exist", contextAlias), "could not switch context")
 	}
 	shared.currentContextIndex = contextIndex
-	shared.currentPage = nil
+	shared.setCurrentPageUnlocked(nil)
 	shared.currentPageIndex = NULL_PAGE
 	return nil
 }
@@ -611,7 +644,7 @@ func (shared *Instance) SwitchPage(contextAlias string, pageAlias string) bool {
 	if pageIndex == NULL_PAGE {
 		return false
 	}
-	shared.currentPage = pageInstance.instance
+	shared.setCurrentPageUnlocked(pageInstance.instance)
 	shared.currentPageIndex = pageIndex
 	shared.currentContextIndex = contextIndex
 	return true
@@ -701,7 +734,7 @@ func (shared *Instance) switchToUntrackedPageUnlocked(pageIndex int) bool {
 		return false
 	}
 	shared.currentPageIndex = -1
-	shared.currentPage = shared.contextInstances[shared.currentContextIndex].instance.Pages()[arrayOfUntrackedPageIndexes[pageIndex-1]]
+	shared.setCurrentPageUnlocked(shared.contextInstances[shared.currentContextIndex].instance.Pages()[arrayOfUntrackedPageIndexes[pageIndex-1]])
 	return true
 }
 
@@ -751,7 +784,7 @@ func (shared *Instance) ClosePage() {
 	}
 	_ = shared.currentPage.Close()
 	if !shared.hasActiveContextUnlocked() {
-		shared.currentPage = nil
+		shared.setCurrentPageUnlocked(nil)
 		shared.currentPageIndex = NULL_PAGE
 		return
 	}
@@ -760,9 +793,9 @@ func (shared *Instance) ClosePage() {
 	}
 	if len(shared.contextInstances[shared.currentContextIndex].pageInstances) != 0 {
 		shared.currentPageIndex = len(shared.contextInstances[shared.currentContextIndex].pageInstances) - 1
-		shared.currentPage = shared.contextInstances[shared.currentContextIndex].pageInstances[shared.currentPageIndex].instance
+		shared.setCurrentPageUnlocked(shared.contextInstances[shared.currentContextIndex].pageInstances[shared.currentPageIndex].instance)
 	} else {
-		shared.currentPage = nil
+		shared.setCurrentPageUnlocked(nil)
 		shared.currentPageIndex = NULL_PAGE
 	}
 }
@@ -791,7 +824,7 @@ func (shared *Instance) CloseContext(contextAlias string) {
 	if shared.currentContextIndex >= 0 && shared.currentContextIndex < len(shared.contextInstances) {
 		currentContextInUse := shared.contextInstances[shared.currentContextIndex]
 		if contextFound.alias == currentContextInUse.alias {
-			shared.currentPage = nil
+			shared.setCurrentPageUnlocked(nil)
 			shared.currentPageIndex = UNTRACKED_PAGE
 			if len(shared.contextInstances) > 1 {
 				shared.currentContextIndex = len(shared.contextInstances) - 2

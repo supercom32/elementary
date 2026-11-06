@@ -89,23 +89,31 @@ so callers can tell "no value property" apart from "an empty value".
 const liveValueScript = `el => (el.value === undefined || el.value === null) ? null : String(el.value)`
 
 /*
-ClickElement is a method which dispatches a mouse click event to the DOM node matched by the given selector. This
-simulates natural user click sequences to trigger navigation links, button submits, or option selections. In addition,
-the following should be noted:
+ClickElement is a method which allows you to dispatch a mouse click event to the DOM node matched by the given
+selector. This simulates natural user click sequences to trigger navigation links, button submits, or option
+selections. If no element matches the selector within the timeout, an error wrapping ErrElementNotFound is returned
+instead of the click being attempted. In addition, the following should be noted:
 
   - This method is a thin wrapper around GetElement and ClickLocator. Selector resolution happens here; the click
-    itself, along with all before/after/failure screenshot capture, is owned exclusively by ClickLocator. Any caller
-    that already holds a resolved playwright.Locator (e.g. from GetElement, GetVisibleElement, or its own querying)
-    should call ClickLocator directly instead of re-resolving through a selector.
+    itself, along with before/after/failure screenshot capture, is owned by ClickLocator. Any caller that already
+    holds a resolved playwright.Locator (e.g. from GetElement, GetVisibleElement, or its own querying) should call
+    ClickLocator directly instead of re-resolving through a selector.
+
+  - When no element is found, a "failure" screenshot is captured under the "click_element" action name, since
+    ClickLocator is never reached in that case.
 
 Example:
 
 	err := agent.ClickElement(elementary.Selector{Value: "css=#submit-button"}, nil, ActionOptions{Timeout: 3 * time.Second})
+	if errors.Is(err, elementary.ErrElementNotFound) {
+	    // the button never appeared
+	}
 */
 func (shared *Instance) ClickElement(selector Selector, locator playwright.Locator, options ...ActionOptions) error {
 	options = applySelectorTimeout(selector, options)
-	element, err := shared.GetElement(selector, locator, options...)
+	element, err := shared.getRequiredElement(selector, locator, options...)
 	if err != nil {
+		shared.captureScreenshot("click_element", "failure", selector.String())
 		return err
 	}
 	return shared.ClickLocator(element, selector.String(), options...)
@@ -151,38 +159,60 @@ func (shared *Instance) ClickLocator(element playwright.Locator, details string,
 }
 
 /*
-ClickElementManually is a method which executes a hardware-style mouse click at the exact coordinates of an element.
-This bypasses high-level click interceptors, addressing complex layouts where standard click emulation is restricted.
+ClickElementManually is a method which allows you to execute a hardware-style mouse click at the center of an
+element. This bypasses high-level click interceptors, addressing complex layouts where standard click emulation is
+restricted. mouseButton must be MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, or MOUSE_BUTTON_RIGHT. In addition, the
+following should be noted:
+
+  - The click lands on the center of the element's bounding box rather than its top-left corner, which can fall
+    outside the element's visible shape (rounded corners, padding) and miss it entirely.
+
+  - An unrecognized mouseButton, a nil element, or an element with no bounding box (for example one that is hidden
+    or detached) returns an error rather than clicking somewhere unintended.
+
+  - parentLocator is unused and kept only for signature compatibility.
 
 Example:
 
-	err := agent.ClickElementManually("left", locator, nil, ActionOptions{Timeout: time.Second})
+	err := agent.ClickElementManually(elementary.MOUSE_BUTTON_LEFT, locator, nil, ActionOptions{Timeout: time.Second})
 */
 func (shared *Instance) ClickElementManually(mouseButton string, element playwright.Locator, parentLocator playwright.Locator, options ...ActionOptions) error {
 	timeoutInMilliseconds, _ := resolveTimeoutInMilliseconds(shared.defaultElementTimeout, options)
 	shared.captureScreenshot("click_element_manually", "before", mouseButton)
-	locator := element
 	var clickOptions playwright.MouseClickOptions
-	if mouseButton == MOUSE_BUTTON_LEFT {
+	switch mouseButton {
+	case MOUSE_BUTTON_LEFT:
 		clickOptions.Button = playwright.MouseButtonLeft
-	} else if mouseButton == MOUSE_BUTTON_MIDDLE {
+	case MOUSE_BUTTON_MIDDLE:
 		clickOptions.Button = playwright.MouseButtonMiddle
-	} else if mouseButton == MOUSE_BUTTON_RIGHT {
+	case MOUSE_BUTTON_RIGHT:
 		clickOptions.Button = playwright.MouseButtonRight
+	default:
+		shared.captureScreenshot("click_element_manually", "failure", mouseButton)
+		return fmt.Errorf("unsupported mouse button %q: expected %q, %q, or %q", mouseButton, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT)
+	}
+	if element == nil {
+		shared.captureScreenshot("click_element_manually", "failure", mouseButton)
+		return errors.New("cannot manually click a nil element")
 	}
 	page, err := shared.getCurrentPage()
 	if err != nil {
 		shared.captureScreenshot("click_element_manually", "failure", mouseButton)
 		return err
 	}
-	_ = locator.Focus(playwright.LocatorFocusOptions{Timeout: &timeoutInMilliseconds})
-	locatorInformation, err := locator.BoundingBox(playwright.LocatorBoundingBoxOptions{Timeout: &timeoutInMilliseconds})
+	_ = element.Focus(playwright.LocatorFocusOptions{Timeout: &timeoutInMilliseconds})
+	boundingBox, err := element.BoundingBox(playwright.LocatorBoundingBoxOptions{Timeout: &timeoutInMilliseconds})
 	if err != nil {
 		shared.captureScreenshot("click_element_manually", "failure", mouseButton)
 		return logger.Error(err, "failed to obtain bounding box of element")
 	}
-	err = page.Mouse().Click(float64(locatorInformation.X), float64(locatorInformation.Y), clickOptions)
-	if err != nil {
+	if boundingBox == nil {
+		shared.captureScreenshot("click_element_manually", "failure", mouseButton)
+		return errors.New("element has no bounding box to click; it may be hidden or detached")
+	}
+	centerX := boundingBox.X + boundingBox.Width/2
+	centerY := boundingBox.Y + boundingBox.Height/2
+	if err := page.Mouse().Click(centerX, centerY, clickOptions); err != nil {
 		shared.captureScreenshot("click_element_manually", "failure", mouseButton)
 		return logger.Error(err, "failed manual mouse click action")
 	}
@@ -191,8 +221,9 @@ func (shared *Instance) ClickElementManually(mouseButton string, element playwri
 }
 
 /*
-FillElement is a method which focuses a designated input element and types the specified text content. This simulates
-form input behaviors on fields, textual areas, or content-editable nodes.
+FillElement is a method which allows you to focus a designated input element and type the specified text content.
+This simulates form input behaviors on fields, textual areas, or content-editable nodes. If no element matches the
+selector within the timeout, an error wrapping ErrElementNotFound is returned instead of the fill being attempted.
 
 Example:
 
@@ -202,7 +233,7 @@ func (shared *Instance) FillElement(textToFill string, selector Selector, parent
 	options = applySelectorTimeout(selector, options)
 	timeoutInMilliseconds, _ := resolveTimeoutInMilliseconds(shared.defaultElementTimeout, options)
 	shared.captureScreenshot("fill_element", "before", selector.String())
-	locator, err := shared.GetElement(selector, parentLocator, options...)
+	locator, err := shared.getRequiredElement(selector, parentLocator, options...)
 	if err != nil {
 		shared.captureScreenshot("fill_element", "failure", selector.String())
 		return err
@@ -217,43 +248,60 @@ func (shared *Instance) FillElement(textToFill string, selector Selector, parent
 }
 
 /*
-MoveMouse is a method which executes a mouse down, linear pointer sweep, and mouse release sequence. This approximates
-human mouse gestures across the canvas coordinates to satisfy basic anti-bot drag interactions.
+MoveMouse is a method which allows you to execute a mouse down, linear pointer sweep, and mouse release sequence.
+This approximates human mouse gestures across the canvas coordinates to satisfy basic anti-bot drag interactions. It
+returns an error if no page is active or any of the three mouse steps fails. In addition, the following should be
+noted:
+
+  - The mouse button is still released when the sweep fails, so a failed call never leaves the button held down.
 
 Example:
 
-	agent.MoveMouse()
+	err := agent.MoveMouse()
 */
-func (shared *Instance) MoveMouse() {
+func (shared *Instance) MoveMouse() error {
 	page, err := shared.getCurrentPage()
 	if err != nil {
-		return
+		return err
 	}
-	var options playwright.MouseMoveOptions
 	steps := 100
-	options.Steps = &steps
-	_ = page.Mouse().Down()
-	_ = page.Mouse().Move(100, 20, options)
-	_ = page.Mouse().Up()
+	if err := page.Mouse().Down(); err != nil {
+		return logger.Error(err, "failed to press the mouse button")
+	}
+	moveErr := page.Mouse().Move(100, 20, playwright.MouseMoveOptions{Steps: &steps})
+	upErr := page.Mouse().Up()
+	if moveErr != nil {
+		return logger.Error(moveErr, "failed to move the mouse")
+	}
+	if upErr != nil {
+		return logger.Error(upErr, "failed to release the mouse button")
+	}
+	return nil
 }
 
 /*
-MouseClick is a method which triggers a single mouse click at specified horizontal and vertical canvas offsets. This is
-suited for targeting coordinate markers on static graphical surfaces that lack underlying HTML tag nodes.
+MouseClick is a method which allows you to trigger a single mouse click at specified horizontal and vertical canvas
+offsets. This is suited for targeting coordinate markers on static graphical surfaces that lack underlying HTML tag
+nodes. It returns an error if no page is active or the click fails, capturing a "failure" screenshot in either case.
 
 Example:
 
-	agent.MouseClick(500, 400)
+	err := agent.MouseClick(500, 400)
 */
-func (shared *Instance) MouseClick(xLocation int, yLocation int) {
+func (shared *Instance) MouseClick(xLocation int, yLocation int) error {
 	details := fmt.Sprintf("%d_%d", xLocation, yLocation)
 	shared.captureScreenshot("mouse_click", "before", details)
 	page, err := shared.getCurrentPage()
 	if err != nil {
-		return
+		shared.captureScreenshot("mouse_click", "failure", details)
+		return err
 	}
-	_ = page.Mouse().Click(float64(xLocation), float64(yLocation))
+	if err := page.Mouse().Click(float64(xLocation), float64(yLocation)); err != nil {
+		shared.captureScreenshot("mouse_click", "failure", details)
+		return logger.Error(err, "failed to click at %s", details)
+	}
 	shared.captureScreenshot("mouse_click", "after", details)
+	return nil
 }
 
 /*
@@ -415,37 +463,90 @@ func (shared *Instance) GetElement(selector Selector, parentLocator playwright.L
 }
 
 /*
-UploadFile is a method which allows you to bind local file payloads directly to a target file input DOM selector. This
-automates multi-part file uploads by mapping files from local storage streams, labelling each upload with the MIME
-type inferred from the file name's extension rather than assuming a fixed type. In addition, the following should be
-noted:
+getRequiredElement is a method which allows you to resolve selector exactly as GetElement does, but treat "nothing
+matched within the timeout" as an error wrapping ErrElementNotFound instead of an empty locator. Every action that
+must act on an element (click, fill, hover) uses this so a missing element fails fast with a clear message, rather
+than the action waiting out a second timeout against an empty locator or silently doing nothing.
 
-  - An unrecognized or missing extension falls back to "application/octet-stream", the standard generic binary MIME
-    type, rather than mislabelling the upload as a specific type it may not actually be.
+Example:
+
+	element, err := shared.getRequiredElement(selector, parentLocator, options...)
+*/
+func (shared *Instance) getRequiredElement(selector Selector, parentLocator playwright.Locator, options ...ActionOptions) (playwright.Locator, error) {
+	element, err := shared.GetElement(selector, parentLocator, options...)
+	if err != nil {
+		return nil, err
+	}
+	count, err := element.Count()
+	if err != nil {
+		return nil, logger.Error(err, "failed to count matches for %s", selector)
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrElementNotFound, selector)
+	}
+	return element, nil
+}
+
+/*
+UploadFile is a method which allows you to bind a single local file to a target file input DOM selector. It is a
+convenience wrapper around UploadFiles for the common one-file case, and behaves identically to calling UploadFiles
+with a one-element slice.
 
 Example:
 
 	err := agent.UploadFile(elementary.Selector{Value: "css=input[type='file']"}, "test-image.jpg", ActionOptions{Timeout: 5 * time.Second})
 */
 func (shared *Instance) UploadFile(selector Selector, fileName string, options ...ActionOptions) error {
+	return shared.UploadFiles(selector, []string{fileName}, options...)
+}
+
+/*
+UploadFiles is a method which allows you to bind one or more local files to a target file input DOM selector,
+replacing whatever files the input previously held. This automates multi-part file uploads, labelling each upload
+with the MIME type inferred from its file name's extension rather than assuming a fixed type. In addition, the
+following should be noted:
+
+  - An unrecognized or missing extension falls back to "application/octet-stream", the standard generic binary MIME
+    type, rather than mislabelling the upload as a specific type it may not actually be.
+
+  - Only each file's base name is exposed to the page, never its full local path, so uploads do not leak the host's
+    directory layout to the site.
+
+  - The selector is resolved through the instance's default selector engine exactly like every other action, so an
+    unprefixed selector is treated as XPath unless SetDefaultSelectorEngine says otherwise.
+
+  - Selecting more than one file requires the target input to carry the "multiple" attribute; the browser rejects the
+    upload otherwise. An empty fileNames slice returns an error rather than clearing the input.
+
+Example:
+
+	err := agent.UploadFiles(elementary.Selector{Value: "css=input[type='file']"}, []string{"front.jpg", "back.jpg"})
+*/
+func (shared *Instance) UploadFiles(selector Selector, fileNames []string, options ...ActionOptions) error {
 	options = applySelectorTimeout(selector, options)
 	timeoutInMilliseconds, _ := resolveTimeoutInMilliseconds(shared.defaultElementTimeout, options)
+	if len(fileNames) == 0 {
+		return errors.New("at least one file name is required to upload")
+	}
 	page, err := shared.getCurrentPage()
 	if err != nil {
 		return err
 	}
-	fileContentsInBytes, err := filesystem.GetFileContentsAsBytes(fileName)
-	if err != nil {
-		return logger.Error(err, "failed to read file content for upload")
+	fileEntries := make([]playwright.InputFile, 0, len(fileNames))
+	for _, fileName := range fileNames {
+		fileContentsInBytes, err := filesystem.GetFileContentsAsBytes(fileName)
+		if err != nil {
+			return logger.Error(err, "failed to read file content for upload: %s", fileName)
+		}
+		fileEntries = append(fileEntries, playwright.InputFile{
+			Name:     filepath.Base(fileName),
+			MimeType: detectMimeType(fileName),
+			Buffer:   fileContentsInBytes,
+		})
 	}
-	fileEntry := playwright.InputFile{
-		Name:     fileName,
-		MimeType: detectMimeType(fileName),
-		Buffer:   fileContentsInBytes,
-	}
-	err = page.SetInputFiles(selector.Value, []playwright.InputFile{fileEntry}, playwright.PageSetInputFilesOptions{Timeout: &timeoutInMilliseconds})
+	err = shared.resolveBaseLocator(page, nil, selector.Value).First().SetInputFiles(fileEntries, playwright.LocatorSetInputFilesOptions{Timeout: &timeoutInMilliseconds})
 	if err != nil {
-		return logger.Error(err, "failed to upload file through playwright")
+		return logger.Error(err, "failed to upload files through playwright to %s", selector)
 	}
 	return nil
 }
@@ -655,22 +756,30 @@ func (shared *Instance) GetNumberOfElements(selector Selector, parentLocator pla
 }
 
 /*
-NavigateBack is a method which triggers backwards navigation in the active browser tab's history. This emulates clicking
-the standard browser back button to handle multi-step layouts.
+NavigateBack is a method which allows you to trigger backwards navigation in the active browser tab's history. This
+emulates clicking the standard browser back button to handle multi-step layouts. The resulting page's hostname is
+recorded as the one BlockRedirects permits, and element lookups return to the main frame, since the frame chosen with
+SwitchToFrame belonged to the page being left. It returns an error if no page is active or the navigation fails;
+having no earlier history entry is not an error and simply leaves the page where it is.
 
 Example:
 
-	agent.NavigateBack()
+	err := agent.NavigateBack()
 */
-func (shared *Instance) NavigateBack() {
+func (shared *Instance) NavigateBack() error {
 	page, err := shared.getCurrentPage()
 	if err != nil {
-		return
+		return err
 	}
 	shared.captureScreenshot("navigate_back", "before", page.URL())
-	_, _ = page.GoBack()
+	shared.resetFrameForPage(page)
+	if _, err := page.GoBack(); err != nil {
+		shared.captureScreenshot("navigate_back", "failure", page.URL())
+		return logger.Error(err, "failed to navigate back")
+	}
 	shared.trackAllowedNavigationHost(page.URL())
 	shared.captureScreenshot("navigate_back", "after", page.URL())
+	return nil
 }
 
 /*
@@ -793,7 +902,7 @@ func (shared *Instance) WaitForElementVisibleStatus(selector Selector, element p
 	if element != nil {
 		elementFound, err = element.QuerySelector(resolved)
 	} else {
-		elementFound, err = page.QuerySelector(resolved)
+		elementFound, err = shared.queryFirstElementHandle(page, selector.Value)
 	}
 
 	if err != nil {
@@ -848,8 +957,24 @@ func (shared *Instance) trackAllowedNavigationHost(url string) {
 }
 
 /*
-NavigateTo is a method which loads and opens the target URL in the active page tab. This initiates standard page browsing
-sessions, loading the requested document context.
+NavigateTo is a method which allows you to load and open the target URL in the active page tab. Failed attempts are
+retried with an increasing pause between them until the navigation timeout elapses, so a briefly unreachable site
+gets several chances without the browser being hammered. In addition, the following should be noted:
+
+  - Each retry is given only the time remaining before the overall deadline, so the total time spent never exceeds
+    the navigation timeout.
+
+  - The pause between attempts starts at navigationRetryInitialBackoff and doubles up to navigationRetryMaxBackoff.
+
+  - A URL that cannot be parsed or has no scheme (for example "example.com" instead of "https://example.com") is
+    rejected immediately instead of being retried, since no amount of retrying can make it load. Retrying also stops
+    at once if the page is closed.
+
+  - With ActionOptions{InfiniteTimeout: true}, failed navigations are retried indefinitely, still with the pause
+    between attempts.
+
+  - Element lookups return to the main frame before navigating, since any frame chosen with SwitchToFrame belonged
+    to the page being left.
 
 Example:
 
@@ -859,18 +984,34 @@ func (shared *Instance) NavigateTo(url string, options ...ActionOptions) error {
 	shared.captureScreenshot("navigate_to", "before", url)
 	timeoutInMilliseconds, isInfinite := resolveTimeoutInMilliseconds(shared.defaultNavigationTimeout, options)
 	logger.Log(logger.TYPE_DEBUG, "Now navigating to '%s' with timeout '%.0f.", url, timeoutInMilliseconds)
+	if parsedURL, parseErr := neturl.Parse(url); parseErr != nil || parsedURL.Scheme == "" {
+		shared.captureScreenshot("navigate_to", "failure", url)
+		return fmt.Errorf("cannot navigate to %q: the URL must be absolute and include a scheme such as https://", url)
+	}
 	page, err := shared.getCurrentPage()
 	if err != nil {
 		return err
 	}
 	shared.trackAllowedNavigationHost(url)
-	navigateOptions := playwright.PageGotoOptions{}
-	navigateOptions.Timeout = &timeoutInMilliseconds
-	startTime := time.Now()
-	timeout := time.Duration(timeoutInMilliseconds) * time.Millisecond
-	_, err = page.Goto(url, navigateOptions)
-	for err != nil && (isInfinite || time.Since(startTime) < timeout) {
-		_, err = page.Goto(url, navigateOptions)
+	shared.resetFrameForPage(page)
+	deadline := time.Now().Add(time.Duration(timeoutInMilliseconds) * time.Millisecond)
+	attemptTimeout := timeoutInMilliseconds
+	backoff := navigationRetryInitialBackoff
+	for {
+		_, err = page.Goto(url, playwright.PageGotoOptions{Timeout: &attemptTimeout})
+		if err == nil || page.IsClosed() {
+			break
+		}
+		if !isInfinite {
+			remaining := time.Until(deadline) - backoff
+			if remaining < time.Millisecond {
+				break
+			}
+			attemptTimeout = float64(remaining.Milliseconds())
+		}
+		logger.Log(logger.TYPE_DEBUG, "Navigation to '%s' failed, retrying in %s: %v", url, backoff, err)
+		time.Sleep(backoff)
+		backoff = min(backoff*2, navigationRetryMaxBackoff)
 	}
 	if err != nil {
 		shared.captureScreenshot("navigate_to", "failure", url)
@@ -879,44 +1020,64 @@ func (shared *Instance) NavigateTo(url string, options ...ActionOptions) error {
 	_ = shared.WaitForPageToBeReady()
 	logger.Log(logger.TYPE_DEBUG, "Page '%s' is now ready!", url)
 	shared.captureScreenshot("navigate_to", "after", url)
-	return err
+	return nil
 }
 
+const (
+	// navigationRetryInitialBackoff is the pause NavigateTo waits after its first failed attempt.
+	navigationRetryInitialBackoff = 250 * time.Millisecond
+
+	// navigationRetryMaxBackoff caps the pause between NavigateTo attempts as it doubles.
+	navigationRetryMaxBackoff = 2 * time.Second
+)
+
 /*
-WaitForPageToChange is a method which blocks execution until the active tab registers a DOM content loaded event, then
-polls until the page URL contains continueIfUrlContains (when non-empty). This is useful for waiting for simple document
-updates or page transition boundaries.
+WaitForPageToChange is a method which allows you to block execution until the active tab registers a DOM content
+loaded event, then poll until the page URL contains continueIfUrlContains (when non-empty). This is useful for
+waiting for simple document updates or page transition boundaries. It returns an error if no page is active, if the
+DOM content loaded event does not arrive in time, or if the URL never comes to contain continueIfUrlContains before
+the timeout.
 
 Example:
 
-	agent.WaitForPageToChange("/dashboard", ActionOptions{Timeout: 5 * time.Second})
+	err := agent.WaitForPageToChange("/dashboard", ActionOptions{Timeout: 5 * time.Second})
 */
-func (shared *Instance) WaitForPageToChange(continueIfUrlContains string, options ...ActionOptions) {
+func (shared *Instance) WaitForPageToChange(continueIfUrlContains string, options ...ActionOptions) error {
 	page, err := shared.getCurrentPage()
 	if err != nil {
-		return
+		return err
 	}
 	timeoutInMilliseconds, isInfinite := resolveTimeoutInMilliseconds(shared.defaultElementTimeout, options)
-	waitOptions := playwright.LoadStateDomcontentloaded
-	_ = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{State: waitOptions, Timeout: &timeoutInMilliseconds})
-
-	if continueIfUrlContains == "" {
-		return
+	err = page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{State: playwright.LoadStateDomcontentloaded, Timeout: &timeoutInMilliseconds})
+	if err != nil {
+		return logger.Error(err, "failed waiting for the page to finish loading")
 	}
-
+	if continueIfUrlContains == "" {
+		return nil
+	}
 	startTime := time.Now()
 	timeout := time.Duration(timeoutInMilliseconds) * time.Millisecond
 	for !strings.Contains(page.URL(), continueIfUrlContains) {
 		if !isInfinite && time.Since(startTime) >= timeout {
-			return
+			return fmt.Errorf("timed out after %s waiting for the page URL to contain %q, last URL was %q", timeout, continueIfUrlContains, page.URL())
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	return nil
 }
 
 /*
-HoverOverElement is a method which scrolls to, positions the mouse cursor over, and clicks the target element. This triggers hover-based
-dropdowns or context menus.
+HoverOverElement is a method which allows you to scroll to and position the mouse cursor over the target element,
+at the offset xLocation and yLocation from the element's top-left corner, without clicking it. This triggers
+hover-based dropdowns, tooltips, or context menus. If no element matches the selector within the timeout, an error
+wrapping ErrElementNotFound is returned. Use HoverAndClickElement to also click once hovering. In addition, the
+following should be noted:
+
+  - The hover is forced, skipping Playwright's actionability checks, so an element partly covered by another one can
+    still be hovered.
+
+  - When no ActionOptions or Selector timeout is given, the hover is bounded by a five second default rather than
+    the instance's element timeout.
 
 Example:
 
@@ -924,43 +1085,68 @@ Example:
 */
 func (shared *Instance) HoverOverElement(selector Selector, locator playwright.Locator, xLocation int, yLocation int, options ...ActionOptions) error {
 	shared.captureScreenshot("hover_over_element", "before", selector.String())
-	options = applySelectorTimeout(selector, options)
-	var hoverOptions playwright.LocatorHoverOptions
-
-	timeout, _ := resolveTimeoutInMilliseconds(5*time.Second, options)
-	hoverOptions.Timeout = &timeout
-
-	forced := true
-	hoverOptions.Force = &forced
-
-	x := float64(xLocation)
-	y := float64(yLocation)
-	hoverOptions.Position = new(playwright.Position)
-	hoverOptions.Position.X = x
-	hoverOptions.Position.Y = y
-
-	element, err := shared.GetElement(selector, locator, options...)
-	if err != nil {
+	if _, err := shared.hoverElement(selector, locator, xLocation, yLocation, options...); err != nil {
 		shared.captureScreenshot("hover_over_element", "failure", selector.String())
 		return err
-	}
-
-	if shared.IsLocatorExists(element) {
-		err = element.Hover(hoverOptions)
-		if err != nil {
-			shared.captureScreenshot("hover_over_element", "failure", selector.String())
-			return logger.Error(err, "failed to hover over the element")
-		}
-
-		err = element.Click(playwright.LocatorClickOptions{Timeout: &timeout})
-		if err != nil {
-			shared.captureScreenshot("hover_over_element", "failure", selector.String())
-			return logger.Error(err, "failed to click on the element")
-		}
 	}
 	shared.captureScreenshot("hover_over_element", "after", selector.String())
 	return nil
 }
+
+/*
+HoverAndClickElement is a method which allows you to hover over the target element exactly as HoverOverElement does
+and then click it. This suits menus that only accept a click once they have been opened by hovering. If no element
+matches the selector within the timeout, an error wrapping ErrElementNotFound is returned and nothing is clicked.
+
+Example:
+
+	err := agent.HoverAndClickElement(elementary.Selector{Value: "css=a.hover-menu"}, nil, 15, 15, ActionOptions{Timeout: 3 * time.Second})
+*/
+func (shared *Instance) HoverAndClickElement(selector Selector, locator playwright.Locator, xLocation int, yLocation int, options ...ActionOptions) error {
+	shared.captureScreenshot("hover_and_click_element", "before", selector.String())
+	element, err := shared.hoverElement(selector, locator, xLocation, yLocation, options...)
+	if err != nil {
+		shared.captureScreenshot("hover_and_click_element", "failure", selector.String())
+		return err
+	}
+	timeout, _ := resolveTimeoutInMilliseconds(hoverDefaultTimeout, applySelectorTimeout(selector, options))
+	if err := element.Click(playwright.LocatorClickOptions{Timeout: &timeout}); err != nil {
+		shared.captureScreenshot("hover_and_click_element", "failure", selector.String())
+		return logger.Error(err, "failed to click on the element %s", selector)
+	}
+	shared.captureScreenshot("hover_and_click_element", "after", selector.String())
+	return nil
+}
+
+/*
+hoverElement is a method which allows you to resolve selector as a required element and hover over it at the given
+offset. It is the shared core of HoverOverElement and HoverAndClickElement, returning the hovered element so the
+latter can click it, and leaving all screenshot capture to its callers.
+
+Example:
+
+	element, err := shared.hoverElement(selector, locator, 15, 15, options...)
+*/
+func (shared *Instance) hoverElement(selector Selector, locator playwright.Locator, xLocation int, yLocation int, options ...ActionOptions) (playwright.Locator, error) {
+	options = applySelectorTimeout(selector, options)
+	timeout, _ := resolveTimeoutInMilliseconds(hoverDefaultTimeout, options)
+	element, err := shared.getRequiredElement(selector, locator, options...)
+	if err != nil {
+		return nil, err
+	}
+	err = element.Hover(playwright.LocatorHoverOptions{
+		Timeout:  &timeout,
+		Force:    playwright.Bool(true),
+		Position: &playwright.Position{X: float64(xLocation), Y: float64(yLocation)},
+	})
+	if err != nil {
+		return nil, logger.Error(err, "failed to hover over the element %s", selector)
+	}
+	return element, nil
+}
+
+// hoverDefaultTimeout bounds HoverOverElement and HoverAndClickElement when no explicit timeout is supplied.
+const hoverDefaultTimeout = 5 * time.Second
 
 /*
 getCurrentPage is a method which returns a race-free snapshot of the active page reference under a read lock. In addition,
@@ -987,8 +1173,11 @@ func (shared *Instance) getCurrentPage() (playwright.Page, error) {
 }
 
 /*
-BlockPopups is a method which intercepts and closes dynamically opened popup pages on the current browser context. This prevents marketing
-popups, blank targets, or ad redirections from interrupting active test procedures.
+BlockPopups is a method which allows you to intercept and close dynamically opened popup pages on the current browser
+context. This prevents marketing popups, blank targets, or ad redirections from interrupting active test procedures.
+In addition, the following should be noted:
+
+  - Only pages opened by another page are closed. Tabs opened deliberately with NewPage stay open.
 
 Example:
 
@@ -1037,16 +1226,10 @@ func (shared *Instance) BlockPopups() error {
 		attachToPage(p)
 	}
 
+	// Only attach here: closing every new page would also close tabs opened deliberately via NewPage. Real popups
+	// are closed by the per-page "popup" listener attached above, which fires only for pages opened by a page.
 	ctx.On("page", func(p playwright.Page) {
 		attachToPage(p)
-		go func(pp playwright.Page) {
-			time.Sleep(150 * time.Millisecond)
-			url := pp.URL()
-			if url == "" || strings.Contains(url, "about:blank") {
-				time.Sleep(250 * time.Millisecond)
-			}
-			_ = pp.Close()
-		}(p)
 	})
 
 	shared.stateMutex.Lock()
@@ -1266,19 +1449,52 @@ func (shared *Instance) resolveSelector(selector string) string {
 }
 
 /*
-resolveBaseLocator is a method which builds the starting locator for a selector lookup, scoped to parentLocator when
-one is given and to the full page otherwise. This is the single place selector resolution and parent-scoping are wired
-together, so every element-lookup method shares identical behavior instead of each re-deriving it.
+resolveBaseLocator is a method which allows you to build the starting locator for a selector lookup, scoped to
+parentLocator when one is given, and otherwise to the frame chosen with SwitchToFrame on page, or the whole page when
+no frame is chosen. This is the single place selector resolution, parent scoping, and frame scoping are wired
+together, so every element-lookup method shares identical behavior instead of each re-deriving it. In addition, the
+following should be noted:
+
+  - Each frame step matches the first frame its selector finds, consistent with how GetElement treats the first
+    matching element.
 
 Example:
 
 	baseLocator := shared.resolveBaseLocator(page, parentLocator, "button.submit")
 */
 func (shared *Instance) resolveBaseLocator(page playwright.Page, parentLocator playwright.Locator, selector string) playwright.Locator {
+	resolved := shared.resolveSelector(selector)
 	if parentLocator != nil {
-		return parentLocator.Locator(shared.resolveSelector(selector))
+		return parentLocator.Locator(resolved)
 	}
-	return page.Locator(shared.resolveSelector(selector))
+	framePath := shared.framePathFor(page)
+	if len(framePath) == 0 {
+		return page.Locator(resolved)
+	}
+	frame := page.FrameLocator(framePath[0]).First()
+	for _, frameSelector := range framePath[1:] {
+		frame = frame.FrameLocator(frameSelector).First()
+	}
+	return frame.Locator(resolved)
+}
+
+/*
+queryFirstElementHandle is a method which allows you to get an element handle for the first element matching
+selector in the current frame scope, or a nil handle and nil error when nothing matches right now. It does not wait
+for the element to appear.
+
+Example:
+
+	handle, err := shared.queryFirstElementHandle(page, "css=#modal")
+*/
+func (shared *Instance) queryFirstElementHandle(page playwright.Page, selector string) (playwright.ElementHandle, error) {
+	locator := shared.resolveBaseLocator(page, nil, selector).First()
+	count, err := locator.Count()
+	if err != nil || count == 0 {
+		return nil, err
+	}
+	timeoutInMilliseconds := float64(shared.defaultElementTimeout.Milliseconds())
+	return locator.ElementHandle(playwright.LocatorElementHandleOptions{Timeout: &timeoutInMilliseconds})
 }
 
 /*

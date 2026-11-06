@@ -222,6 +222,63 @@ err := browser.Initialize("default_ctx", "shop", Elementary.BROWSER_CHROME, 1280
 
 Setting `Args` replaces the list entirely rather than appending to it. Elementary's Chromium default is `--mute-audio`. If you want to keep it alongside your own flags, include it explicitly as shown above.
 
+## Routing Traffic Through a Proxy
+
+`BrowserOptions.Proxy` sends all of the browser's traffic through a proxy server, so sites see the proxy's address instead of yours. HTTP and SOCKS proxies are supported, and `Bypass`, `Username`, and `Password` are optional:
+
+```go
+err := browser.Initialize("default_ctx", "shop", Elementary.BROWSER_CHROME, 1280, 800, false, &Elementary.BrowserOptions{
+    Proxy: &Elementary.ProxyOptions{Server: "http://myproxy.com:3128", Username: "user", Password: "secret"},
+})
+```
+
+## Saving and Restoring a Login Session
+
+`SaveStorageState` writes the current context's cookies and local storage to a JSON file. Pass that file as `BrowserOptions.StorageStatePath` to start a later session already logged in, including on sites that keep login tokens in local storage rather than cookies. Treat the file like a password, since it holds live session credentials:
+
+```go
+err := browser.SaveStorageState("session.json")
+
+// later, in a new run
+err = browser.Initialize("default_ctx", "shop", Elementary.BROWSER_CHROME, 1280, 800, false, &Elementary.BrowserOptions{
+    StorageStatePath: "session.json",
+})
+```
+
+## Handling Pop-up Dialogs
+
+JavaScript `alert`, `confirm`, and `prompt` boxes never block a script: every dialog is answered automatically, by default with Cancel. `SetDialogOptions` changes the answer for every page from then on, and `GetDialogs` lists what was shown:
+
+```go
+browser.SetDialogOptions(Elementary.DialogOptions{Accept: true, PromptText: "yes"})
+browser.ClickElement(deleteButton, nil) // the "Are you sure?" box is answered with OK
+
+for _, dialog := range browser.GetDialogs() {
+    fmt.Println(dialog.Type, dialog.Message)
+}
+```
+
+## Downloading Files
+
+`DownloadByClicking` clicks a link or button and saves the file it downloads, returning where it was saved. `WaitForDownload` does the same for any other trigger. The site's suggested file name is kept but made safe, and an existing file is never overwritten (a number is added instead, as in `report (1).pdf`):
+
+```go
+path, err := browser.DownloadByClicking(invoiceLink, "./downloads", nil)
+```
+
+## Working Inside Iframes
+
+Payment forms, login widgets, and embedded editors often live inside an `<iframe>`. `SwitchToFrame` moves every element method (find, click, fill, read, wait, hover, upload, form controls, and downloads) inside that frame. Call it again to go into a frame nested inside it, `SwitchToParentFrame` to step out one level, and `SwitchToMainFrame` to return to the page. Changing to another tab or context, or calling `NavigateTo` or `NavigateBack`, always starts back on the main page:
+
+```go
+paymentFrame := Elementary.Selector{Value: "css=iframe#payment", Description: "payment frame"}
+browser.SwitchToFrame(paymentFrame)
+browser.FillElement("4242 4242 4242 4242", cardNumberField, nil)
+browser.SwitchToMainFrame()
+```
+
+JavaScript evaluation, `ScrollPageBy`, and mouse coordinate methods still act on the page as a whole.
+
 # Example
 
 Here is a highly compact, single-browser example that demonstrates almost all of Elementary's core features (setup, timeouts, multiple tabs, selector auto-detection, screenshots, attributes, and visibility checks) in one short script.

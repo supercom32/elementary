@@ -52,6 +52,66 @@ func newStealthAgent(t *testing.T, defaultContextAlias string, defaultPageAlias 
 	return &agent
 }
 
+var (
+	shortActionOptions     = elementary.ActionOptions{Timeout: 300 * time.Millisecond}
+	missingElementSelector = elementary.Selector{Value: "css=#does-not-exist", Description: "missing element"}
+)
+
+/*
+newPlainAgent is a test helper which initializes a plain, non-stealth headless elementary.Instance with a "main"
+context and a "tab1" page, registering Close as test cleanup. The tests that use it exercise local pages only, so
+StealthPatch is deliberately left off to keep them launching quickly and offline.
+*/
+func newPlainAgent(t *testing.T) *elementary.Instance {
+	t.Helper()
+	var agent elementary.Instance
+	if err := agent.Initialize("main", "tab1", elementary.BROWSER_CHROME, 1024, 768, false, nil); err != nil {
+		t.Fatalf("Failed to initialize plain agent: %v", err)
+	}
+	t.Cleanup(func() { _ = agent.Close() })
+	return &agent
+}
+
+/*
+navigateOrFail is a test helper which navigates the agent to url, failing the test immediately if navigation errors.
+*/
+func navigateOrFail(t *testing.T, agent *elementary.Instance, url string) {
+	t.Helper()
+	if err := agent.NavigateTo(url); err != nil {
+		t.Fatalf("NavigateTo(%q) failed: %v", url, err)
+	}
+}
+
+/*
+evaluateOrFail is a test helper which evaluates script on the agent's current page through EvaluateJavaScript,
+failing the test if evaluation errors.
+*/
+func evaluateOrFail(t *testing.T, agent *elementary.Instance, script string) any {
+	t.Helper()
+	result, err := agent.EvaluateJavaScript(script)
+	if err != nil {
+		t.Fatalf("EvaluateJavaScript(%q) failed: %v", script, err)
+	}
+	return result
+}
+
+/*
+evaluateString is a test helper which evaluates expression on the agent's current page and returns the result as a
+string, failing the test if evaluation errors or the result is not a string.
+*/
+func evaluateString(t *testing.T, agent *elementary.Instance, expression string) string {
+	t.Helper()
+	result, err := agent.GetCurrentPage().Evaluate(expression)
+	if err != nil {
+		t.Fatalf("Failed to evaluate %q: %v", expression, err)
+	}
+	resultString, isString := result.(string)
+	if !isString {
+		t.Fatalf("Expected %q to evaluate to a string, got %T (%v)", expression, result, result)
+	}
+	return resultString
+}
+
 /*
 fingerprintTableValue is a test helper which reads the property-value cell corresponding to a
 named row in fingerprint-scan.com's results table. The site renders results as a two-column

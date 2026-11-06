@@ -1,6 +1,7 @@
 package elementary
 
 import (
+	"errors"
 	"fmt"
 	"github.com/mxschmitt/playwright-go"
 	"github.com/supercom32/elementary/logger"
@@ -232,4 +233,35 @@ func (shared *Instance) getCookiesUnlocked() ([]playwright.Cookie, error) {
 		return nil, logger.Error(fmt.Errorf("failed to retrieve cookies via playwright: %w", err), "failed to retrieve cookies from context")
 	}
 	return cookies, nil
+}
+
+/*
+SaveStorageState is a method which allows you to write the active browser context's full session, its cookies and
+the local storage of every origin it has visited, to fileName as JSON. Loading that file back through
+BrowserOptions.StorageStatePath restores the session, including logins that keep their tokens in local storage
+rather than cookies, which SaveNetscapeCookies alone cannot capture. In addition, the following should be noted:
+
+  - An existing file at fileName is overwritten.
+
+  - The file contains live session credentials, so it should be stored with the same care as a password.
+
+Example:
+
+	err := agent.SaveStorageState("session.json")
+*/
+func (shared *Instance) SaveStorageState(fileName string) error {
+	if strings.TrimSpace(fileName) == "" {
+		return errors.New("storage state file name must not be empty")
+	}
+	shared.stateMutex.RLock()
+	if !shared.hasActiveContextUnlocked() {
+		shared.stateMutex.RUnlock()
+		return logger.Error(fmt.Errorf("no active browser context exists to save storage state"), "failed to save storage state to %s", fileName)
+	}
+	context := shared.contextInstances[shared.currentContextIndex].instance
+	shared.stateMutex.RUnlock()
+	if _, err := context.StorageState(playwright.BrowserContextStorageStateOptions{Path: playwright.String(fileName)}); err != nil {
+		return logger.Error(err, "failed to save storage state to %s", fileName)
+	}
+	return nil
 }

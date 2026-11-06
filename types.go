@@ -177,6 +177,11 @@ runtime override of client metadata such as user agent headers to approximate di
 var (
 	// ErrWindowsRestartRequired is returned when an automatic driver repair occurs on Windows, requiring the application to be restarted.
 	ErrWindowsRestartRequired = errors.New("the simulation engine has been reset, but requires a program restart on Windows to unlock binaries")
+
+	// ErrElementNotFound is wrapped by every action that must act on an element (ClickElement, FillElement,
+	// HoverOverElement, HoverAndClickElement) when no element matches its selector within the timeout. Test for it
+	// with errors.Is.
+	ErrElementNotFound = errors.New("element not found")
 )
 
 type BrowserOptions struct {
@@ -191,12 +196,76 @@ type BrowserOptions struct {
 
 	Channel string
 
+	// Proxy routes all of the browser's traffic through a proxy server, per Playwright's proxy launch option. Nil
+	// connects directly. It applies to every context the Instance creates.
+	Proxy *ProxyOptions
+
+	// StorageStatePath names a file previously written by SaveStorageState. When set, each context created with
+	// these options starts with that file's cookies and local storage, restoring a saved login session. Empty
+	// starts every context with a clean session.
+	StorageStatePath string
+
 	// Args overrides the command-line arguments passed to the browser at launch, per
 	// Playwright's Args launch option. When nil, Chromium launches with Elementary's default
 	// ("--mute-audio") and Firefox launches with none. Setting Args replaces the list entirely
 	// rather than appending to it, so callers who want to keep the Chromium default alongside
 	// their own flags must include it explicitly.
 	Args []string
+}
+
+/*
+ProxyOptions is a structure which describes the proxy server BrowserOptions.Proxy routes browser traffic through.
+*/
+type ProxyOptions struct {
+	// Server is the proxy address, for example "http://myproxy.com:3128" or "socks5://myproxy.com:3128". A form
+	// without a scheme such as "myproxy.com:3128" is treated as an HTTP proxy. Required.
+	Server string
+
+	// Bypass is an optional comma-separated list of domains that connect directly instead of through the proxy, for
+	// example ".example.com, internal.local".
+	Bypass string
+
+	// Username and Password are optional credentials for an HTTP proxy that requires authentication.
+	Username string
+	Password string
+}
+
+/*
+DialogOptions is a structure which decides how Elementary answers JavaScript dialogs (alert, confirm, prompt, and
+beforeunload) on every page the Instance controls. The zero value dismisses every dialog, matching Playwright's own
+default.
+*/
+type DialogOptions struct {
+	// Accept answers dialogs with OK when true and with Cancel when false. Accepting a beforeunload dialog lets the
+	// page be left; dismissing it keeps the page open.
+	Accept bool
+
+	// PromptText is the answer entered into prompt() dialogs when Accept is true. It is ignored for other dialog
+	// types and when dismissing.
+	PromptText string
+}
+
+/*
+DialogInfo is a structure which records one JavaScript dialog Elementary answered, as returned by GetDialogs.
+*/
+type DialogInfo struct {
+	// ContextAlias is the alias of the browser context whose page showed the dialog.
+	ContextAlias string
+
+	// Type is the dialog kind: "alert", "confirm", "prompt", or "beforeunload".
+	Type string
+
+	// Message is the text the dialog displayed.
+	Message string
+
+	// DefaultValue is the pre-filled answer of a prompt() dialog, and empty for other types.
+	DefaultValue string
+
+	// PageURL is the address of the page that showed the dialog, when known.
+	PageURL string
+
+	// Accepted reports whether the dialog was answered with OK rather than Cancel.
+	Accepted bool
 }
 
 /*
@@ -253,10 +322,23 @@ type Instance struct {
 	screenshotArchiver       archiver.Archiver
 	archiverMutex            sync.Mutex
 
+	// dialogOptions and dialogHistory back SetDialogOptions and GetDialogs. They are guarded by their own
+	// dialogMutex rather than stateMutex because dialog handlers run while a page call is blocked waiting for the
+	// dialog to be answered, and that call may already hold stateMutex (InjectJavaScript does).
+	dialogMutex   sync.Mutex
+	dialogOptions DialogOptions
+	dialogHistory []DialogInfo
+
 	// minimizeWatchers holds one entry per window currently enforced by MinimizeWindow(true), keyed by that
 	// window's Chrome DevTools Protocol windowId. Each value is closed by stopMinimizeWatcherUnlocked or
 	// stopAllMinimizeWatchersUnlocked to signal that window's watcher goroutine to exit. Guarded by stateMutex.
 	minimizeWatchers map[any]chan struct{}
+
+	// framePage and framePath record the frame chosen with SwitchToFrame: framePath holds one resolved frame
+	// selector per nesting level, and applies only while framePage is still the current page, so switching to a
+	// different page or context automatically returns lookups to that page's main frame. Guarded by stateMutex.
+	framePage playwright.Page
+	framePath []string
 
 	// Parameters for reinitialization
 	defaultContextAlias string

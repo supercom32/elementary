@@ -49,11 +49,10 @@ func (shared *Instance) Initialize(defaultContextAlias string, defaultPageAlias 
 	shared.height = height
 	shared.isVisible = isVisible
 
-	if browserOptions != nil && browserOptions.StealthPatch && browserType != BROWSER_CHROME {
-		return logger.Error(errors.New("stealth patch is only supported for chromium"), "cannot apply stealth patch")
-	}
-	if browserOptions != nil && browserOptions.Channel != "" && browserType != BROWSER_CHROME {
-		return logger.Error(errors.New("channel is only supported for chromium"), "cannot apply channel")
+	// Invalid options are rejected here, before InitializeDriver, so they are never mistaken for a broken driver
+	// install and answered with a Repair.
+	if err := validateBrowserOptions(browserType, browserOptions); err != nil {
+		return err
 	}
 
 	if IS_DEBUG_ENABLED {
@@ -249,13 +248,10 @@ func (shared *Instance) InitializeDriver(defaultContextAlias string, defaultPage
 	isHeadless := !isVisible
 	var runOptions playwright.RunOptions
 	runOptions.Browsers = []string{browserType}
-	if browserOptions != nil && browserOptions.Channel != "" && browserType != BROWSER_CHROME {
-		return logger.Error(errors.New("channel is only supported for chromium"), "cannot apply channel")
+	if err := validateBrowserOptions(browserType, browserOptions); err != nil {
+		return err
 	}
 	if browserOptions != nil && browserOptions.StealthPatch {
-		if browserType != BROWSER_CHROME {
-			return logger.Error(errors.New("stealth patch is only supported for chromium"), "cannot apply stealth patch")
-		}
 		baseDriverDirectory, err := shared.resolveBaseDriverDirectory()
 		if err != nil {
 			return logger.Error(err, "could not resolve driver directory for stealth patch")
@@ -285,6 +281,7 @@ func (shared *Instance) InitializeDriver(defaultContextAlias string, defaultPage
 		chromiumLaunchOptions := playwright.BrowserTypeLaunchOptions{
 			Headless: playwright.Bool(isHeadless),
 			Args:     chromiumArgs,
+			Proxy:    shared.browserOptions.Proxy.toPlaywright(),
 		}
 		if shared.browserOptions.Channel != "" {
 			chromiumLaunchOptions.Channel = playwright.String(shared.browserOptions.Channel)
@@ -295,6 +292,7 @@ func (shared *Instance) InitializeDriver(defaultContextAlias string, defaultPage
 		shared.browserInstance, err = shared.playwrightInstance.Firefox.Launch(playwright.BrowserTypeLaunchOptions{
 			Headless: playwright.Bool(isHeadless),
 			Args:     shared.browserOptions.Args,
+			Proxy:    shared.browserOptions.Proxy.toPlaywright(),
 		})
 	}
 	if err != nil {
@@ -312,6 +310,56 @@ func (shared *Instance) InitializeDriver(defaultContextAlias string, defaultPage
 		return logger.Error(err, "failed to create default page")
 	}
 	return nil
+}
+
+/*
+validateBrowserOptions is a function which allows you to reject BrowserOptions that cannot work with browserType
+before anything is launched: StealthPatch and Channel are Chromium only, and a Proxy must name a Server. A nil
+browserOptions is always valid.
+
+Example:
+
+	if err := validateBrowserOptions(browserType, browserOptions); err != nil { return err }
+*/
+func validateBrowserOptions(browserType string, browserOptions *BrowserOptions) error {
+	if browserOptions == nil {
+		return nil
+	}
+	if browserOptions.StealthPatch && browserType != BROWSER_CHROME {
+		return logger.Error(errors.New("stealth patch is only supported for chromium"), "cannot apply stealth patch")
+	}
+	if browserOptions.Channel != "" && browserType != BROWSER_CHROME {
+		return logger.Error(errors.New("channel is only supported for chromium"), "cannot apply channel")
+	}
+	if browserOptions.Proxy != nil && strings.TrimSpace(browserOptions.Proxy.Server) == "" {
+		return logger.Error(errors.New("proxy server must not be empty"), "cannot apply proxy")
+	}
+	return nil
+}
+
+/*
+toPlaywright is a method which allows you to convert ProxyOptions into Playwright's launch-option form, leaving empty
+optional fields unset. A nil receiver returns nil, meaning no proxy.
+
+Example:
+
+	launchOptions.Proxy = shared.browserOptions.Proxy.toPlaywright()
+*/
+func (proxyOptions *ProxyOptions) toPlaywright() *playwright.Proxy {
+	if proxyOptions == nil {
+		return nil
+	}
+	proxy := &playwright.Proxy{Server: proxyOptions.Server}
+	if proxyOptions.Bypass != "" {
+		proxy.Bypass = playwright.String(proxyOptions.Bypass)
+	}
+	if proxyOptions.Username != "" {
+		proxy.Username = playwright.String(proxyOptions.Username)
+	}
+	if proxyOptions.Password != "" {
+		proxy.Password = playwright.String(proxyOptions.Password)
+	}
+	return proxy
 }
 
 /*
@@ -512,11 +560,7 @@ func (shared *Instance) SaveScreenshot(path string, screenshotName string, optio
 
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
 	normalizedFilename := fmt.Sprintf("%s_%s", timestamp, screenshotName)
-	replacer := strings.NewReplacer(
-		"/", "_", "\\", "_", "?", "_", "%", "_", "*", "_",
-		":", "_", "|", "_", "\"", "_", "<", "_", ">", "_",
-	)
-	normalizedFilename = replacer.Replace(normalizedFilename)
+	normalizedFilename = illegalFilenameCharacterReplacer.Replace(normalizedFilename)
 
 	shared.archiverMutex.Lock()
 	if shared.screenshotArchiver != nil {
@@ -539,6 +583,13 @@ func (shared *Instance) SaveScreenshot(path string, screenshotName string, optio
 	}
 	return nil
 }
+
+// illegalFilenameCharacterReplacer swaps every character that is illegal in a file name on at least one supported
+// operating system for an underscore, so names built from page content are safe to write anywhere.
+var illegalFilenameCharacterReplacer = strings.NewReplacer(
+	"/", "_", "\\", "_", "?", "_", "%", "_", "*", "_",
+	":", "_", "|", "_", "\"", "_", "<", "_", ">", "_",
+)
 
 /*
 Close is a method which disposes of the active browser session and pages. This performs a graceful teardown to reclaim
@@ -616,6 +667,8 @@ Example:
 */
 func (shared *Instance) resetTeardownStateUnlocked() {
 	shared.stopAllMinimizeWatchersUnlocked()
+	shared.framePage = nil
+	shared.framePath = nil
 	shared.playwrightInstance = nil
 	shared.browserInstance = nil
 	shared.contextInstances = nil
